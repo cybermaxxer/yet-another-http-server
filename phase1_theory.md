@@ -215,3 +215,19 @@ BSD Sockets were created **before** generic void * pointers were standardized in
  * **Memory Address:** Just a number pointing to RAM (e.g., 0x7ffeefbff4a0).
  * **Pointer Casting:** Changing the instructions on *how* to read bytes at that address, without moving or altering a single bit in RAM.
 
+Got it — you mean the **TCP 3-way handshake** (`SYN → SYN-ACK → ACK`), not synchronous I/O.
+
+In your server flow:
+
+1. `socket()` — no handshake yet  
+2. `bind()` — still no handshake  
+3. `listen()` — socket is now ready to receive connection attempts  
+4. Client calls `connect()` → kernel sends/receives:
+   - client → server: **SYN**
+   - server → client: **SYN-ACK**
+   - client → server: **ACK**
+5. After that final ACK, the connection is established in kernel state and queued for accept.
+6. `accept()` just dequeues an already-established connection and returns a new fd.
+
+So the handshake happens **after `listen()` and due to client `connect()`**, not because `accept()` itself performs the handshake. `accept()` typically returns only once handshake is complete (for normal TCP).
+
