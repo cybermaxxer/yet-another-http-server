@@ -14,33 +14,38 @@ so the picture i had (fds traveling across the wire, a separate "reply channel")
 
 every tcp connection on the internet is uniquely pinned down by four values:
 
-```
-(client ip, client port, server ip, server port)
-```
+- client ip
+    
+- client port
+    
+- server ip
+    
+- server port
+    
 
 as long as this exact combination is unique, the kernel can always tell which connection a packet belongs to. this is the thing that let me stop thinking about "the connection" as some abstract concept and start thinking about it as a specific 4 number key.
 
-## client side: one socket for the whole conversation
-
-1. `socket()` creates an fd, say `fd 3`.
-2. `connect(server_ip, server_port)` is called.
-3. the os auto assigns the client an ephemeral (random high number) port, something like `54321`.
-4. that same `fd 3` is used to both send and receive for the entire life of the connection.
-
-nothing fancy here, one fd, one job.
-
-## server side: one listener, many workers
+## client side vs. server side sockets
 
 this is the part that actually clicked for me once i separated it into two distinct sockets doing two distinct jobs.
 
 **the listening socket**, made by `listen()`:
+
 - bound to one local port, e.g. port 80.
-- its only job is to catch incoming connection requests. it never carries actual data.
+    
+- its only job is to catch incoming connection requests.
+    
+- it never carries actual data.
+    
 
 **the connected socket**, returned by `accept()`:
+
 - every time a client connects, `accept()` hands back a brand new fd, e.g. `fd 4`.
+    
 - this new fd is bound to that one specific client's 4 tuple: `(client_ip, 54321, server_ip, 80)`.
+    
 - the listening socket is now free again to accept the next client.
+    
 
 so a busy server has 1 listening fd and n connected fds, one per active client. the listening socket never touches data, it's purely a greeter.
 
@@ -51,68 +56,124 @@ i originally thought `accept()` was the thing that performed the handshake. it's
 real order:
 
 1. `socket()`, no handshake yet.
+    
 2. `bind()`, still nothing.
+    
 3. `listen()`, socket is now ready to receive connection attempts, still no handshake yet.
-4. client calls `connect()`, this is what actually kicks off the handshake:
-   - client to server: `SYN`
-   - server to client: `SYN-ACK`
-   - client to server: `ACK`
+    
+4. client calls `connect()`, this is what actually kicks off the handshake (client sends `SYN`, server sends `SYN-ACK`, client sends `ACK`).
+    
 5. once that final `ACK` lands, the kernel already considers the connection established and queues it.
-6. `accept()` just dequeues an already finished connection and hands back a new fd. it doesn't wait through the handshake itself, the handshake already happened before `accept()` returns.
+    
+6. `accept()` just dequeues an already finished connection and hands back a new fd.
+    
 
 so `accept()` is more like picking up a phone that's already ringing than dialing the call.
-
-## how the server os actually routes an incoming packet
-
-when a packet lands on the server, the kernel does two separate lookups, at two separate layers.
-
-**layer 3, routing:** checks if the destination ip matches this machine and picks the right network interface. this is the `ip route` step.
-
-**layer 4, socket lookup:** hashes the packet's 4 tuple `(client ip, client port, server ip, server port)` and checks it against a table of established connections.
-
-- if there's a match, the data goes straight into that connection's dedicated socket buffer, e.g. `fd 4`. this is the fast path.
-- if there's no match, e.g. this is a fresh `SYN`, it falls through to a second table, the listening sockets, matched only on destination ip and port. if that matches, the request goes to the listening socket to start a handshake.
-- if neither table has a match, the kernel sends back a `TCP RST` and drops it, this is what a closed port looks like from the outside.
-
-this whole lookup runs in roughly constant time because it's a hash table, not a scan, so it doesn't get slower as more connections pile up. it's also how discord, chrome, and my own server can all sit on the same network card without any cross talk, their 4 tuples hash to different buckets.
 
 ## the pointer cast that confused me: `(struct sockaddr *)&serv_addr`
 
 this one took a while to actually understand instead of just copy pasting.
 
-```c
+C
+
+```
 bind(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
 ```
 
 breaking it into two separate operations:
 
 - `&serv_addr` gets the raw memory address of my `sockaddr_in` struct, e.g. `0x7ffeefbff4a0`.
+    
 - `(struct sockaddr *)` doesn't move or touch a single bit at that address, it just tells the compiler "read the bytes at this address as if they were a `struct sockaddr`, not a `struct sockaddr_in`."
+    
 
-so the cast changes how the bytes get interpreted, not what the bytes are.
+c has no inheritance, so back when bsd sockets were designed in the early 80s, there was no way to write one `bind()` that accepts ipv4, ipv6, and unix sockets as different "subclasses." instead they defined one generic base struct, and every protocol specific struct is laid out so the family field sits at the exact same offset, byte 0. `bind()` reads the first 2 bytes, sees `AF_INET`, and now knows it's actually holding a `sockaddr_in` underneath.
 
-**why does the api force this at all?** c has no inheritance, so back when bsd sockets were designed in the early 80s, there was no way to write one `bind()` that accepts ipv4, ipv6, and unix sockets as different "subclasses." instead they defined one generic base struct:
+## threat modeling phase 1: trusting the wire
 
-```c
-struct sockaddr {
-    unsigned short sa_family;   // e.g. AF_INET, AF_INET6
-    char           sa_data[14]; // protocol specific bytes
-};
+i got the basic socket loop working and it spammed a hardcoded `200 OK` response back. i honestly thought i was done with the networking part. i assumed parsing was just a matter of throwing some string split functions at the buffer.
+
+i was wrong. tcp doesn't know what http is, and it definitely doesn't preserve message boundaries. an http request on the wire isn't a neat object; it's just a raw stream of untrusted bytes.
+
+here is the exact code i wrote in phase 1 to handle incoming data:
+
+C
+
+```
+char buffer[BUFFER_SIZE] = {0}; 
+ssize_t bytes_read = read(client_fd, buffer, BUFFER_SIZE); 
+printf("Received message: %s\n", buffer);
 ```
 
-and every protocol specific struct, like `sockaddr_in`, is laid out so the `sa_family` / `sin_family` field sits at the exact same offset, byte 0. that's the trick that makes the whole thing safe: `bind()` reads the first 2 bytes, sees `AF_INET`, and now knows it's actually holding a `sockaddr_in` underneath, so it can read the port and ip correctly from there.
+this code assumes three incredibly dangerous things:
 
-i also wondered why they didn't just use `void *` since that's the normal generic pointer in c. two reasons: `void *` wasn't standardized until ansi c (c89), which came after bsd sockets already existed, and `void *` can't be dereferenced directly anyway, you'd still need a cast at the point of use. so the explicit struct pointer cast was effectively doing manual polymorphism before c had any real way to express it.
+1. it assumes one `read()` equals one complete http request.
+    
+2. it assumes the client will nicely send text.
+    
+3. it blindly prints whatever was in the buffer to the console.
+    
 
-## the mental model i'm keeping from this
+### the vulnerability: out-of-bounds read leading to segfault
 
-- a memory address is just a number pointing into ram.
-- a pointer's type is not a property of the memory, it's an instruction to the compiler on how to read the bytes at that address.
-- casting `(struct sockaddr *)&serv_addr` changes the second thing, never the first.
+in c, strings must end with a null terminator `\0`. i initialized the buffer with `{0}`, which means all 1024 bytes are `\0`.
 
-## code up untill this point:
+but look at the `read()` call. i told it to read up to `BUFFER_SIZE` (1024 bytes). if a client sends exactly 1024 bytes of garbage, `read()` overwrites every single null terminator in that array.
 
-```c
+then, i pass it to `printf("%s", buffer)`. `printf` doesn't know how big `buffer` is. it just starts at index 0 and iterates forward in memory until it hits a `\0`. because the client overwrote the last `\0`, `printf` iterates right out of bounds into memory it doesn't own.
+
+### the exploit: breaking my own server
+
+to exploit this, you don't even need a specialized tool. a few lines of python using raw tcp sockets will instantly crash the server.
+
+Python
+
+```
+import socket
+
+# create a payload of exactly 1024 'A's without any newlines or null bytes
+payload = b'A' * 1024 
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect(("127.0.0.1", 8080))
+s.sendall(payload)
+s.close()
+```
+
+the millisecond this payload hits the server, `read()` fills the buffer with 'A's. `printf` tries to print it, marches past the 1024th byte looking for a null terminator, hits unmapped memory, and triggers a `Segmentation fault (core dumped)`. remote denial of service (dos) in three lines of code.
+
+### the patch: application-layer framing (leading into phase 2)
+
+to fix this, i had to completely change my mental model. the actual job of the parser isn't "reading the request." it's forcing every single byte to prove it belongs in a valid request, and rejecting it the millisecond it fails.
+
+first, we stop trusting `read()` to preserve boundaries. we have to accumulate bytes in a loop, capping the read at `BUFFER_SIZE - 1` to guarantee space for a null terminator.
+
+C
+
+```
+while (bytes_read < BUFFER_SIZE - 1) {
+    ssize_t chunk_read = read(client_fd, buffer + bytes_read, BUFFER_SIZE - 1 - bytes_read);
+    // ... error checking ...
+    bytes_read += chunk_read;
+    buffer[bytes_read] = '\0'; // manually force the null terminator
+    
+    // check if we've hit \r\n\r\n 
+    request_state = request_is_complete(buffer, bytes_read);
+    if (request_state != 1) {
+        break; 
+    }
+}
+```
+
+second, i learned to never trust the `printf`. printing unvalidated input is a massive security philosophy violation. in phase 2, i completely remove the raw `printf`. i now capture the state of the parser, and i only print the parsed method, path, and version if the explicit state machine gives the green light. if it's a bad request, i silently return an `HTTP/1.1 400 Bad Request` and don't log the malicious payload.
+
+## checkpoint: phase 1 raw code
+
+this is the vulnerable but functional phase 1 code before i tore out the monolithic loop to build the state machine parser.
+
+C
+
+```
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>

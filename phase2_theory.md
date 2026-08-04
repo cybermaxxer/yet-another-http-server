@@ -4,11 +4,11 @@ these are my notes from writing a raw http/1.1 parser from scratch. no framework
 
 ## the misconception i had going in
 
-in phase 1, i wrote a loop that called `read()` exactly once, blindly printed whatever was in the buffer to the console, and spammed a hardcoded `200 OK` response back. i honestly thought i was done with the networking part. i've always thought of http requests as structured objects—you ask a framework for `request.headers["Content-Length"]` and it just hands it to you. i assumed parsing was just a matter of throwing some string split functions at the buffer.
+in phase 1, i wrote a loop that called `read()` exactly once, blindly printed whatever was in the buffer to the console, and spammed a hardcoded `200 OK` response back. i honestly thought i was done with the networking part.
 
-i was wrong. tcp doesn't know what http is, and it definitely doesn't preserve message boundaries. an http request on the wire isn't a neat object; it's just a raw stream of untrusted bytes.
+i've always thought of http requests as structured objects—you ask a framework for `request.headers["Content-Length"]` and it just hands it to you. i assumed parsing was just a matter of throwing some string split functions at the buffer.
 
-if an attacker sends 10,000 "A"s without a newline, simple string split functions like `strtok` will walk right off the edge of the buffer and crash the server. the actual job of the parser isn't "reading the request." it's forcing every single byte to prove it belongs in a valid request, and rejecting it the millisecond it fails.
+i was wrong. tcp doesn't know what http is, and it definitely doesn't preserve message boundaries. an http request on the wire isn't a neat object; it's just a raw stream of untrusted bytes. the actual job of the parser isn't "reading the request." it's forcing every single byte to prove it belongs in a valid request, and rejecting it the millisecond it fails.
 
 ## splitting the monolith: `.c`, `.h`, and `#ifndef`
 
@@ -16,7 +16,7 @@ as the logic grew from a simple `while(1)` loop to a full parser, dumping everyt
 
 the `.h` (header) file is the contract. it holds my `ParserState` enum, my `Header` and `Request` structs, and the function signatures. the `.c` file contains the actual logic.
 
-one thing that tripped me up early on was the concept of "include guards" at the top of the header file:
+one thing that tripped me up early on was "include guards" at the top of the header file:
 
 C
 
@@ -27,124 +27,33 @@ C
 #endif // SERVER_H
 ```
 
-here is why those matter: if i eventually write multiple `.c` files that all `#include "server.h"`, the compiler would see my `Request` struct definition multiple times and throw a redefinition error. the `#ifndef` (if not defined) directive tells the preprocessor: "if you've already seen `SERVER_H` during this compilation pass, skip this entire file." it guarantees the structs are only defined exactly once.
+if i write multiple `.c` files that all `#include "server.h"`, the compiler would see my `Request` struct definition multiple times and throw a redefinition error. the `#ifndef` directive guarantees the structs are defined exactly once per compilation pass.
 
-## the first trap: tcp vs. http boundaries
+## threat modeling phase 2: the parsing engine
 
-my phase 1 code assumed that one `read()` equaled one complete http request. but a client can send the headers in one tcp packet and the body three seconds later in another.
+building this parser hammered home the core appsec mindset: you don't write code for when things go right. you write code for when the bytes on the wire are actively trying to destroy your server. here are the exact vulnerabilities i introduced, exploited, and patched while building the state machine.
 
-so, i had to change how i buffer data. i wrote a new helper function called `request_is_complete()`. now, my server sits in a `while` loop, accumulating bytes into the buffer until one of two things happens:
+### threat model 1: the string split trap
 
-1. it sees the `\r\n\r\n` sequence, which marks the end of the headers.
-    
-2. if there is a `Content-Length` header, it extracts that number and keeps looping until the total bytes read covers the headers plus the body length.
-    
+**the vulnerability:** my instinct was to use `strtok` to find spaces and newlines. but `strtok` uses static internal state and is non-reentrant. it expects perfectly formatted c-strings. **the exploit:** an attacker opens a socket and sends 10,000 "A"s without a single space or newline. `strtok` keeps walking memory looking for a delimiter, steps right off the edge of the buffer, and crashes the server. **the patch:** i dropped `strtok` completely and built an explicit state machine. i defined states like `STATE_METHOD` and `STATE_PATH`, and i read the buffer exactly one character at a time in a `for` loop using a `switch(state)` block. every single byte dictates exactly what the next legal state can be. if i'm in `STATE_METHOD` and see an unsupported method, i immediately drop to `STATE_ERROR`.
 
-C
+### threat model 2: memory exhaustion (infinite headers)
 
-```
-while (bytes_read < BUFFER_SIZE - 1) {
-    ssize_t chunk_read = read(client_fd, buffer + bytes_read, BUFFER_SIZE - 1 - bytes_read);
-    // ... error checking ...
-    bytes_read += chunk_read;
-    buffer[bytes_read] = '\0';
-    request_state = request_is_complete(buffer, bytes_read);
-    if (request_state != 1) {
-        break; // we have a full request or an error
-    }
-}
-```
+**the vulnerability:** http headers are dynamic, so i built a linked list to store them using `malloc(sizeof(Header))`. **the exploit:** an attacker connects and sends `a: b\r\n` in an infinite loop. my code faithfully `malloc`s a new node for every single line. eventually, the server runs out of ram, the os kills the process, and we have a catastrophic denial of service (dos). **the patch:** i added a hard cap. i defined `MAX_HEADERS` to 16 and added a `header_count` variable. if a client exceeds 16 headers, the parser immediately breaks to `STATE_ERROR`.
 
-this was my first real lesson in application-layer framing. http has to build its own boundaries on top of tcp's endless byte stream.
+### threat model 3: content-length integer overflow
 
-## why i didn't use `strtok` (the state machine)
+**the vulnerability:** parsing the body size sounds simple, but string-to-integer conversion is full of holes. **the exploit:** an attacker sends `Content-Length: -100` or an absolutely massive number. naive string conversion translates this into integer overflow, resulting in undersized buffer allocations or massive memory grabs. **the patch:** i switched to `strtol`, which lets you catch exactly where the parsing stopped. i explicitly verify that the pointer moved, that no garbage characters were left behind, and that the parsed length is strictly between 0 and `INT_MAX`.
 
-my next instinct was to use `strtok` to find the spaces and newlines. but `strtok` uses static internal state, making it non-reentrant. if the input doesn't look exactly like a perfect http request, it breaks.
+### threat model 4: http request smuggling (ambiguity)
 
-instead, i built an explicit state machine, which is how real parsers actually work.
+**the vulnerability:** the 2019 request smuggling attacks happened because proxy servers and backend servers disagreed on where a request ended. the core issue is usually receiving both `Content-Length` and `Transfer-Encoding: chunked`. **the exploit:** an attacker sends both headers. if the proxy prioritizes `Transfer-Encoding` but my backend prioritizes `Content-Length`, the attacker can hide a second, fully-formed malicious request inside the body of the first one. **the patch:** the fix isn't to write clever code to figure out which header is right; the fix is to refuse the ambiguity. i track `hasTransfer` and `hasLength`. if i see multiple framing headers, or if i see `Transfer-Encoding` in this phase, i don't resolve it—i just reject the request outright with `STATE_ERROR`.
 
-i defined an enum with states like `STATE_METHOD`, `STATE_PATH`, and `STATE_HEADER_KEY`. i read the buffer exactly one character at a time in a `for` loop, using a `switch(state)` block to determine what the current character means.
+## in-place mutation and memory leaks
 
-C
+instead of allocating new memory for strings like the method and path, i use an in-place mutation trick. when my state machine hits a space, i do `buffer[i] = '\0'`. i just overwrite spaces and carriage returns with null terminators in the original buffer, and point my `Request` struct fields to offsets inside that one buffer. it's fast and avoids massive memory overhead.
 
-```
-for(int i = 0; i < bytes_read; i++){
-    c = buffer[i];
-    switch(state) {
-        case STATE_METHOD:
-            if (c == ' ' ){
-                buffer[i] = '\0';
-                request->method = start;
-                // validate method token early to reject unsupported methods
-                if (!(strcmp(request->method, "GET") == 0 || strcmp(request->method, "POST") == 0)) {
-                    state = STATE_ERROR;
-```
-
-this means every single byte dictates exactly what the next legal state can be. there is no guessing. if i am in `STATE_METHOD` and i see a space, i replace it with a null terminator `\0`, point the `request->method` pointer to the start of that string, and transition to `STATE_PATH`. if i see anything else that violates the rules (like an unsupported method), i immediately drop to `STATE_ERROR`.
-
-## in-place mutation over copying
-
-notice the `buffer[i] = '\0'` trick above. instead of `malloc`-ing new memory for the method, the path, and the version strings, i just overwrite the spaces and carriage returns with null terminators in the original buffer.
-
-this effectively splits the raw buffer into isolated c-strings. my `Request` struct just holds pointers pointing to different offsets inside that one original buffer. it's fast, and it avoids massive memory overhead.
-
-## ambiguity is a vulnerability (request smuggling)
-
-the 2019 http request smuggling attacks happened because servers and proxies disagreed on where a request actually ended. the core issue usually involves sending both a `Content-Length` header and a `Transfer-Encoding: chunked` header.
-
-if my server prioritizes `Content-Length` but the proxy in front of it prioritizes `Transfer-Encoding`, an attacker can hide a second malicious request inside the body of the first.
-
-the fix isn't to write clever code to figure out which header is right. the fix is to refuse to participate in the ambiguity.
-
-in my parser, i track `hasTransfer` and `hasLength`. if i see a `Transfer-Encoding` header, or if i see multiple framing headers, i don't try to resolve it. i just reject the request outright.
-
-C
-
-```
-if (request->headers->key && strcmp(request->headers->key, "Content-Length") == 0) {
-    if(hasTransfer || hasLength) { 
-        state = STATE_ERROR; 
-        break;
-    }
-    // ...
-```
-
-## memory exhaustion (the infinite header attack)
-
-headers are dynamic, so i built a linked list to store them using `malloc(sizeof(Header))`.
-
-but what happens if a client just keeps sending `a: b\r\n` forever? if i just keep `malloc`-ing new header nodes, the server will eventually run out of memory and crash. this is a classic denial of service (dos) vector.
-
-the solution was adding a hard cap. i added a `header_count` variable and set a `MAX_HEADERS` limit of 16.
-
-C
-
-```
-if (header_count >= MAX_HEADERS) {
-    state = STATE_ERROR;
-    break;
-}
-```
-
-if a client needs more than 16 headers for a simple request, they get dropped.
-
-## the content-length integer overflow trap
-
-parsing the body size sounds simple, but string-to-integer conversion is full of holes. if an attacker sends `Content-Length: -100` or a massive number, it can lead to integer overflow and undersized buffer allocations.
-
-i used `strtol` to do the conversion. this function lets you catch exactly where the parsing stopped. i explicitly check that the pointer moved, that it didn't leave garbage characters behind, and that the parsed length is strictly between 0 and `INT_MAX`.
-
-## the "never trust the printf" lesson
-
-this was a big realization for me. in phase 1, i just threw `printf("Received message: %s\n", buffer)` right after reading the socket.
-
-i learned that printing unvalidated input is a massive security philosophy violation. if an attacker sends a request with a highly malformed path, or a buffer that isn't cleanly null-terminated, my naive `printf` would iterate right out of bounds looking for `\0` and trigger a segmentation fault.
-
-so, i changed the logic. i now capture the state of the parser in `isGoodRequest`. i only print the parsed method, path, version, and headers if the state machine gives the green light. if it's a bad request, i silently return an `HTTP/1.1 400 Bad Request` and don't log the malicious payload.
-
-## cleaning up error paths
-
-finally, because error paths are where most memory leaks hide, i had to make sure i cleaned up my dynamically allocated headers. whether the request succeeds or fails, i pass the linked list to my new `free_headers()` function before closing the connection.
+but for the headers, i still used a dynamically allocated linked list. this meant i had to clean up error paths. error paths are where most memory leaks hide, so whether the request succeeds or fails, i pass the list to my new `free_headers()` function before closing the connection.
 
 C
 
@@ -158,12 +67,21 @@ void free_headers(Header *header) {
 }
 ```
 
-building this parser hammered home the core appsec mindset: you don't write code for when things go right. you write code for when the bytes on the wire are actively trying to destroy your server.
+## transitioning to phase 3: high concurrency
+
+right now, the parser is hardened. the server won't crash on bad formatting, it won't be smuggled, and it bounds its memory usage. but there is still one glaring architectural flaw: the main loop.
+
+currently, it's a single-client blocking loop. if an attacker opens a connection and just sits there sending one byte every ten seconds (a slowloris attack), no other client can connect. the entire server hangs.
+
+in phase 3, i'll be tearing out this blocking architecture to build for high concurrency. the focus shifts entirely to kernel-level multiplexing (using `epoll` or `kqueue`), preventing data races in shared memory, and ensuring the server can handle thousands of concurrent, adversarial connections safely.
 
 ## checkpoint: the full code so far
 
 **`server.h`**
-```c
+
+C
+
+```
 #ifndef SERVER_H
 #define SERVER_H
 
@@ -207,7 +125,9 @@ int parse_request(char *buffer, Request *request, ssize_t bytes_read);
 
 **`server.c`**
 
-```c
+C
+
+```
 #include "server.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -516,11 +436,6 @@ int main() {
             const char response[] = "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request"; //prepare a simple HTTP response to send back to the client, indicating a bad request (400 Bad Request) and including a message body ("Bad Request") with the appropriate Content-Length header
             write(client_fd, response, sizeof(response) - 1); //write() sends the response back to the client through the client socket (client_fd), using sizeof(response) - 1 to exclude the null terminator from the length of the data being sent
         }
-        //learned a thing. i would previously print the whole parsed message without checking if it's a good or bad request
-        //an appsec phiolosophy is to never trust the input, so if the request is bad, we should not print it out, because it could be malicious.
-        //so what would happen is that if somebody sends a request with a very long path, it would print out the whole path, which could be a buffer overflow attack. so we should only print the parsed request if it's a good request.
-        //not only buffer overflow, it'd iterate the linked list of headers, and if the headers are malformed, it could cause a segmentation fault or other undefined behavior. so we should only print the parsed request if it's a good request.
-        //because the stuff isnt null terminated, so if the request is bad, it could cause a segmentation fault or other undefined behavior. so we should only print the parsed request if it's a good request.
         else {
            printf("Parsed request: method=%s, path=%s, version=%s\n", request.method, request.path, request.version);
             for(Header *header = request.headers; header != NULL; header = header->next) { //iterate through the linked list of headers in the request structure, printing each header's key and value
