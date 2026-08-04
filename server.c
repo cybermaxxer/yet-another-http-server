@@ -1,26 +1,12 @@
+#include "server.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#define PORT 8080
-#define MAX_CLIENTS 10
-#define BUFFER_SIZE 1024
-#define IP "127.0.0.1"
-typedef enum { // state machine of a parsing HTTP request
-    STATE_METHOD, // waiting for the HTTP method (e.g., GET, POST)
-    STATE_PATH, // waiting for the requested path (e.g., /index.html)
-    STATE_VERSION, // waiting for the HTTP version (e.g., HTTP/1.1)
-    STATE_HEADER_KEY, // waiting for the header key (e.g., Content-Type)
-    STATE_HEADER_VALUE, // waiting for the header value (e.g., text/html)
-    STATE_BODY, // waiting for the HTTP body (if any, e.g., in POST requests)
-    STATE_DONE, // finished parsing the request
-    STATE_ERROR // encountered an error while parsing the request
-} ParserState;
-typedef struct header{
-    char *key; // pointer to the header key string
-    char *value; // pointer to the header value string
-    struct header *next; // pointer to the next header in the linked list
-} Header;
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <string.h>
+
 void free_headers(Header *header) {
     while (header != NULL) { // iterate through the linked list of headers
         Header *next = header->next; // store the pointer to the next header
@@ -28,13 +14,7 @@ void free_headers(Header *header) {
         header = next; // move to the next header in the list
     }
 }
-typedef struct request{
-    char *method; // pointer to the HTTP method string
-    char *path; // pointer to the requested path string
-    char *version; // pointer to the HTTP version string
-    Header *headers; // pointer to the linked list of headers
-    char *body; // pointer to the HTTP body string (if any)
-} Request;
+
 int parse_request(char *buffer, Request *request, ssize_t bytes_read) {
     request->headers = NULL;
     char *start = buffer; // pointer to the start of the buffer, which contains the raw HTTP request data
@@ -49,14 +29,22 @@ int parse_request(char *buffer, Request *request, ssize_t bytes_read) {
                 if (c == ' ' ){
                 buffer[i] = '\0'; // replace the space character with a null terminator to mark the end of the current token (e.g., method, path, version)
                 request->method = start; // set the method field of the request structure to point to the start of the buffer, which now contains the HTTP method string
+                // validate method token early to reject unsupported methods
+                if (!(strcmp(request->method, "GET") == 0 || strcmp(request->method, "POST") == 0)) {
+                    state = STATE_ERROR; // unsupported method
+                }
                 start = buffer + i + 1; // update the start pointer to point to the character after the space, which is the beginning of the requested path
                 state = STATE_PATH; // transition to the STATE_PATH state to parse the requested path next
             }
                 break;
+
             case STATE_PATH:
                 if (c == ' ' ){
                 buffer[i] = '\0'; // replace the space character with a null terminator to mark the end of the current token (e.g., method, path, version)
                 request->path = start; // set the path field of the request structure to point to the start of the buffer, which now contains the requested path string
+                if(request->path[0] != '/') { // validate that the path starts with a forward slash, which is required for valid HTTP requests
+                    state = STATE_ERROR; // invalid path
+                }
                 state = STATE_VERSION; // transition to the STATE_VERSION state to parse the HTTP version next
                 start = buffer + i + 1; // update the start pointer to point to the character after the space, which is the beginning of the HTTP version
             }
@@ -70,6 +58,9 @@ int parse_request(char *buffer, Request *request, ssize_t bytes_read) {
                     next_char = '\0'; // if the next character index is out of bounds, set next_char to a null character to avoid undefined behavior
                 }
                 if (c == '\r' && next_char == '\n') { // check if the current character is a carriage return and the next character is a newline, indicating the end of the
+                    if(strcmp(start, "HTTP/1.1") != 0) { // validate that the HTTP version is "HTTP/1.1", which is required for valid HTTP requests
+                        state = STATE_ERROR; // invalid HTTP version
+                    }
                     state = STATE_HEADER_KEY; // transition to the STATE_HEADER_KEY state to parse the header key next
                     request->version = start; // set the version field of the request structure to point to the start of the buffer, which now contains the HTTP version string
                     start = buffer + i + 2; // update the start pointer to point to the character after the CRLF sequence, which is the beginning of the header key
