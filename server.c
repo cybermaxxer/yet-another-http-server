@@ -15,57 +15,70 @@ void free_headers(Header *header) {
         header = next; // move to the next header in the list
     }
 }
-
 static int request_is_complete(const char *buffer, ssize_t bytes_read) {
-    const char *header_end = strstr(buffer, "\r\n\r\n");
+    const char *header_end = strstr(buffer, "\r\n\r\n"); // locate the end of the HTTP headers, indicated by a double CRLF sequence
     if (header_end == NULL) {
-        return 1;
+        return 1; // return 1 to indicate that the headers are incomplete and we need to read more data
     }
 
-    ssize_t header_end_offset = (ssize_t)(header_end - buffer);
-    if (header_end_offset >= BUFFER_SIZE) {
-        return -1;
+    ssize_t header_end_offset = (ssize_t)(header_end - buffer); // calculate the exact byte offset where the headers end
+    
+    // FIX: Add +2 to ensure we have room for the final header's \r\n, plus the null terminator
+    if (header_end_offset + 2 >= BUFFER_SIZE) {
+        return -1; // return -1 to indicate an error, as the headers exceed our maximum allowed buffer size, preventing overflow
     }
 
-    char header_copy[BUFFER_SIZE];
-    memcpy(header_copy, buffer, (size_t)header_end_offset);
-    header_copy[header_end_offset] = '\0';
+    char header_copy[BUFFER_SIZE]; // create a local copy of the headers to safely modify and parse without altering the raw buffer
+    
+    // FIX: Copy +2 bytes so the final header retains its \r\n for the parser to find
+    memcpy(header_copy, buffer, (size_t)header_end_offset + 2);
+    header_copy[header_end_offset + 2] = '\0'; // safely null-terminate the copied headers string
 
-    long content_length = 0;
-    int saw_content_length = 0;
+    long content_length = 0; // variable to store the parsed Content-Length value
+    int saw_content_length = 0; // flag to indicate whether a valid Content-Length header was found
 
-    char *line = header_copy;
+    char *line = header_copy; // pointer used to iterate through each line of the headers
+    const char *cl_key = "Content-Length:"; // define the target header key we are looking for
+    size_t cl_key_len = strlen(cl_key); // precompute the length of the target header key to avoid repeated calculations
+
     while (*line != '\0') {
-        char *line_end = strstr(line, "\r\n");
+        char *line_end = strstr(line, "\r\n"); // find the CRLF sequence that marks the end of the current header line
         if (line_end == NULL) {
-            break;
+            break; // stop parsing if no valid line ending is found, preventing out-of-bounds memory reads
         }
 
-        size_t line_length = (size_t)(line_end - line);
-        if (line_length == strlen("Content-Length:") && strncmp(line, "Content-Length:", line_length) == 0) {
-            char *value = line + line_length;
-            while (*value == ' ') {
-                value++;
+        size_t line_length = (size_t)(line_end - line); // calculate the length of the entire current header line
+        
+        // check if the line is long enough to contain the key, and use case-insensitive comparison to prevent request smuggling
+        if (line_length >= cl_key_len && strncasecmp(line, cl_key, cl_key_len) == 0) {
+            char *value = line + cl_key_len; // advance the pointer past the "Content-Length:" key to begin reading the value
+            
+            // safely skip any leading spaces or tabs before the actual numeric value begins
+            while (value < line_end && (*value == ' ' || *value == '\t')) {
+                value++; 
             }
 
-            char *end = NULL;
-            long parsed_length = strtol(value, &end, 10);
-            if (end == value || *end != '\0' || parsed_length < 0 || parsed_length > INT_MAX) {
-                return -1;
+            char *end = NULL; // pointer to store the location where strtol stops parsing
+            long parsed_length = strtol(value, &end, 10); // convert the extracted string value into a base-10 long integer
+            
+            // validate that strtol consumed valid digits, did not overflow, and stopped at a valid HTTP whitespace or carriage return
+            if (end == value || (end != line_end && *end != ' ' && *end != '\t' && *end != '\r') || parsed_length < 0 || parsed_length > INT_MAX) {
+                return -1; // return -1 indicating a malformed Content-Length value, neutralizing potential desync attacks
             }
 
-            content_length = parsed_length;
-            saw_content_length = 1;
+            content_length = parsed_length; // assign the safely parsed integer to our content_length tracker
+            saw_content_length = 1; // flip the flag to indicate we successfully located and processed the Content-Length
         }
 
-        line = line_end + 2;
+        line = line_end + 2; // advance the line pointer past the \r\n to begin evaluating the next header
     }
 
     if (!saw_content_length) {
-        return 0;
+        return 0; // return 0 (complete) if there is no Content-Length, implying a request (like GET) with no body
     }
-
-    return bytes_read >= header_end_offset + 4 + content_length ? 0 : 1;
+    
+    // calculate total expected bytes (headers + double CRLF + body) and check if we have received everything over the socket
+    return bytes_read >= header_end_offset + 4 + content_length ? 0 : 1; 
 }
 
 int parse_request(char *buffer, Request *request, ssize_t bytes_read) {
