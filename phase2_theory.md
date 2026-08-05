@@ -209,6 +209,36 @@ static int request_is_complete(const char *buffer, ssize_t bytes_read) {
     return bytes_read >= header_end_offset + 4 + content_length ? 0 : 1; 
 }
 ```
+
+#### Complete Recap of `request_is_complete`
+
+```
+[ Raw TCP Stream in Buffer ]
+         │
+         ▼
+1. Locate Header End: Search for "\r\n\r\n"
+   ├── Not found? ──► Return 1 (Incomplete: Keep reading from socket)
+   └── Found!
+         │
+         ▼
+2. Create Safe Sandbox: Copy headers to header_copy & append '\0'
+         │
+         ▼
+3. Scan Line-by-Line:
+   ├── Jump line-by-line using pointer arithmetic (`line_end + 2`)
+   └── Case-insensitive check (`strncasecmp`) for "Content-Length:"
+         │
+         ├── Found key? ──► Extract digits with `strtol`, validate against bad characters
+         └── No key?   ──► `saw_content_length = false`
+         │
+         ▼
+4. Make the Final Call:
+   ├── No Content-Length? ──► Return 0 (Complete: It's a bodyless request like GET)
+   └── Has Content-Length? ──► Is `bytes_read >= header_len + 4 + content_length`?
+                                 ├── Yes ──► Return 0 (Complete)
+                                 └── No  ──► Return 1 (Incomplete)
+```
+
 ---
 ## transitioning to phase 3: high concurrency
 

@@ -78,7 +78,12 @@ static int request_is_complete(const char *buffer, ssize_t bytes_read) {
     }
     
     // calculate total expected bytes (headers + double CRLF + body) and check if we have received everything over the socket
-    return bytes_read >= header_end_offset + 4 + content_length ? 0 : 1; 
+    if (bytes_read < header_end_offset + 4 + content_length) {
+        return 1; // return 1 (incomplete) if we haven't received the full body yet
+    }
+    else{
+        return 0; // return 0 (complete) if we have received the full body as indicated by Content-Length
+    }
 }
 
 int parse_request(char *buffer, Request *request, ssize_t bytes_read) {
