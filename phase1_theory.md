@@ -171,9 +171,7 @@ second, i learned to never trust the `printf`. printing unvalidated input is a m
 
 this is the vulnerable but functional phase 1 code before i tore out the monolithic loop to build the state machine parser.
 
-C
-
-```
+```c
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
